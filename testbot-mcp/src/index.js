@@ -41,6 +41,9 @@ const CREDENTIAL_SCHEMA = z.object({
   password: z.string().max(200).optional(),
 });
 
+const TEST_STRATEGY_SCHEMA = z.enum(['sequential', 'script']);
+const VIDEO_MODE_SCHEMA = z.enum(['on', 'retain-on-failure']);
+
 const PRD_FILE_SCHEMA = z.object({
   name: z.string().min(1).max(255),
   contentType: z.string().min(1).max(128).optional(),
@@ -54,6 +57,7 @@ const UI_SUBMISSION_SCHEMA = z.object({
   startCommand: z.string().min(1).max(500),
   generateTests: z.boolean(),
   openDashboard: z.boolean(),
+  videoMode: VIDEO_MODE_SCHEMA.optional(),
   credentials: z.union([
     CREDENTIAL_SCHEMA,
     z.array(CREDENTIAL_SCHEMA).max(10),
@@ -517,6 +521,41 @@ class HealixMCPServer {
     return resolveBoolean(params.autoOpenBrowser, envAutoOpen);
   }
 
+  resolveTestStrategy(value) {
+    const raw = String(value || process.env.HEALIX_TEST_STRATEGY || 'sequential').trim().toLowerCase();
+    return raw === 'script' ? 'script' : 'sequential';
+  }
+
+  resolveVideoMode(value) {
+    const raw = String(value || process.env.HEALIX_VIDEO_MODE || 'on').trim().toLowerCase();
+    return raw === 'retain-on-failure' ? 'retain-on-failure' : 'on';
+  }
+
+  hasDirectRunConfig(params = {}) {
+    return Boolean(
+      params &&
+      typeof params.baseURL === 'string' &&
+      params.baseURL.trim() &&
+      typeof params.startCommand === 'string' &&
+      params.startCommand.trim()
+    );
+  }
+
+  buildDirectUISubmission(baseConfig, params = {}) {
+    return {
+      testType: params.testType || baseConfig.testType || 'both',
+      scope: params.scope,
+      baseURL: params.baseURL || baseConfig.baseURL,
+      startCommand: params.startCommand || baseConfig.startCommand,
+      generateTests: params.generateTests !== false,
+      openDashboard: params.openDashboard !== false,
+      videoMode: this.resolveVideoMode(params.videoMode || baseConfig.videoMode),
+      credentials: params.credentials,
+      prd: null,
+      prdFiles: null,
+    };
+  }
+
   createBasePipelineConfig(context, params) {
     const normalizedCodebase = this.normalizeCodebaseContext(params.codebaseContext);
     const hasLocalProject = this.looksLikeLocalProjectPath(context.projectPath);
@@ -642,8 +681,10 @@ class HealixMCPServer {
       apiOnly: typeof params.apiOnly === 'boolean' ? params.apiOnly : detectedApiOnly,
       jira: params.jira,
       openDashboard: params.openDashboard !== false,
+      testStrategy: this.resolveTestStrategy(params.testStrategy),
       generationMode: resolvedGenerationMode,
       artifactMode: params.artifactMode || 'hybrid',
+      videoMode: this.resolveVideoMode(params.videoMode),
       browserMode: params.browserMode || 'chromium',
       validateGeneratedTests: params.validateGeneratedTests !== false,
       aiFailureAnalysis: params.aiFailureAnalysis !== false,
@@ -726,6 +767,7 @@ class HealixMCPServer {
         testType: validatedConfig.testType,
         generateTests: validatedConfig.generateTests,
         openDashboard: validatedConfig.openDashboard,
+        videoMode: this.resolveVideoMode(validatedConfig.videoMode || baseConfig.videoMode),
         startCommand: corrected.startCommand,
         baseURL: corrected.baseURL,
         port: corrected.port,
@@ -1037,12 +1079,17 @@ class HealixMCPServer {
         inputSchema: z.object({
           projectPath: z.string().optional().describe('Path to the project to test (defaults to current workspace)'),
           testType: z.enum(['frontend', 'backend', 'both']).optional().describe('Type of tests to run'),
+          testStrategy: TEST_STRATEGY_SCHEMA.optional().describe('Testing strategy: sequential runs live turn-by-turn tests before synthesizing specs; script uses legacy full-spec generation. Default: sequential.'),
           generateTests: z.boolean().optional().describe('Whether to generate new tests (true) or use existing tests (false)'),
           prdFile: z.string().optional().describe('Path to PRD/requirements document for test generation (optional)'),
           codebaseContext: CODEBASE_CONTEXT_SCHEMA.optional().describe('Structured codebase context from AI agent analysis (pages, apiEndpoints, workflows)'),
           baseURL: z.string().optional().describe('Base URL for the application under test'),
           port: z.number().optional().describe('Port number the app runs on'),
           startCommand: z.string().optional().describe('Command to start the app server (e.g., "npm start")'),
+          credentials: z.union([
+            CREDENTIAL_SCHEMA,
+            z.array(CREDENTIAL_SCHEMA).max(10),
+          ]).optional().describe('Optional role credentials used for auth setup and authenticated tests'),
           jira: z.object({
             enabled: z.boolean().optional(),
             baseUrl: z.string().optional(),
@@ -1061,6 +1108,7 @@ class HealixMCPServer {
           serverStartTimeoutMs: z.number().int().min(10000).max(300000).optional().describe('Server startup timeout in ms before failing readiness checks (default: 90000)'),
           serverHealthCheckIntervalMs: z.number().int().min(250).max(5000).optional().describe('Interval in ms between server readiness probes (default: 1000)'),
           artifactMode: z.enum(['hybrid', 'full']).optional().describe('Artifact capture mode'),
+          videoMode: VIDEO_MODE_SCHEMA.optional().describe('Playwright video capture mode for Healix runs. Default: on.'),
           browserMode: z.enum(['chromium', 'smoke-matrix', 'full-matrix']).optional().describe('Browser execution mode'),
           validateGeneratedTests: z.boolean().optional().describe('Validate generated tests before execution'),
           aiFailureAnalysis: z.boolean().optional().describe('Enable AI analysis for failed tests'),
@@ -1824,6 +1872,7 @@ Return the JSON structure above based on what you find in the codebase.
         projectPath: baseConfig.projectPath,
         project: baseConfig.projectName,
         testType: baseConfig.testType,
+        testStrategy: baseConfig.testStrategy,
         strictAIGeneration: baseConfig.strictAIGeneration !== false,
       },
     });
@@ -1832,6 +1881,74 @@ Return the JSON structure above based on what you find in the codebase.
     const headless = this.resolveHeadlessPreference(params);
     const autoOpenBrowser = this.resolveAutoOpenBrowserPreference(params, headless);
     let configUrl = null;
+
+    if (this.hasDirectRunConfig(params)) {
+      const directSubmission = this.buildDirectUISubmission(baseConfig, params);
+      const waitForConfig = Promise.resolve(directSubmission);
+
+      this.writeRunStatus(statusFile, {
+        runId,
+        phase: 'config_received',
+        message: 'Configuration supplied by MCP arguments. Starting Healix worker...',
+        project: baseConfig.projectName,
+        aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
+        testStrategy: baseConfig.testStrategy,
+      });
+      this.emitTelemetry({
+        toolName: 'healix_test_my_app',
+        eventType: 'config_direct',
+        runId,
+        phase: 'config_received',
+        status: 'success',
+        success: true,
+        message: 'Configuration supplied directly via MCP arguments',
+        metadata: {
+          project: baseConfig.projectName,
+          testStrategy: baseConfig.testStrategy,
+        },
+      });
+
+      this.continuePipelineAfterConfig({ waitForConfig, runId, statusFile, statusDir, baseConfig })
+        .finally(() => { this._activeConfigUILauncher = null; })
+        .catch((err) => {
+          Logger.error('Index', `Pipeline failure for run ${runId}`, { error: err?.message, code: err?.code });
+          try {
+            this.writeRunStatus(statusFile, {
+              runId,
+              phase: 'error',
+              message: err?.message || 'Pipeline failed',
+              error: err?.message || String(err),
+              errorCode: err?.code || 'PIPELINE_FAILED',
+              project: baseConfig.projectName,
+              testStrategy: baseConfig.testStrategy,
+            });
+          } catch (_) {}
+          process.stderr.write(`[HEALIX] Pipeline failed for run ${runId}: ${err?.message || err}\n`);
+        });
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              runId,
+              project: baseConfig.projectName,
+              phase: 'started',
+              statusFile,
+              dashboardUrl: `${dashboardUrl.replace(/\/+$/, '')}/test-run/live-${runId}`,
+              testStrategy: baseConfig.testStrategy,
+              message: `Healix started automatically using testStrategy=${baseConfig.testStrategy}.`,
+              agentInstructions: [
+                `The test pipeline is running in the BACKGROUND. This tool returned immediately; no tests have completed yet.`,
+                `You MUST now call healix_check_run_status with { runId: "${runId}" } every ~15 seconds until the response has isTerminal:true.`,
+                `Do NOT hand control back to the user, summarize, or declare the task done while isTerminal is false.`,
+              ],
+            }, null, 2),
+          },
+        ],
+      };
+    }
 
     {
       // ── Config UI: always launched — return immediately with URL, run pipeline in background ──
@@ -1848,6 +1965,7 @@ Return the JSON structure above based on what you find in the codebase.
           port: String(baseConfig.port),
           startCommand: baseConfig.startCommand,
           testType: baseConfig.testType,
+          testStrategy: baseConfig.testStrategy,
           generateTests: baseConfig.generateTests,
           openDashboard: baseConfig.openDashboard,
           strictAIGeneration: baseConfig.strictAIGeneration !== false,

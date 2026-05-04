@@ -479,6 +479,7 @@ class ReportGenerator {
         generator: 'healix-mcp',
         runId: this.stripAnsiAndNormalize(runId || null),
         generationMeta: generationMeta || null,
+        videoValidation: this.stripAnsiAndNormalize(testResults.videoValidation || null),
         fallbackUsed: Boolean(fallbackUsed),
       },
       stats: {

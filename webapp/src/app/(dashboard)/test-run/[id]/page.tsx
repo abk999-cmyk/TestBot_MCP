@@ -79,6 +79,25 @@ interface QualityWarning {
   missingCategories?: string[];
 }
 
+interface VideoValidationIssue {
+  testName?: string;
+  status?: string;
+  path?: string | null;
+  reason?: string;
+  size?: number;
+}
+
+interface VideoValidation {
+  ok?: boolean;
+  requiredForAllExecuted?: boolean;
+  totalExecuted?: number;
+  testsWithVideo?: number;
+  videoCount?: number;
+  missing?: VideoValidationIssue[];
+  invalid?: VideoValidationIssue[];
+  error?: string;
+}
+
 interface AgentGenerationQuality {
   valid?: boolean;
   errorCode?: string;
@@ -119,6 +138,7 @@ interface ReportJson {
     runId?: string;
     run_id?: string;
     generationMeta?: GenerationMetaShape | null;
+    videoValidation?: VideoValidation | null;
     live?: {
       isLive?: boolean;
       phase?: string;
@@ -1817,6 +1837,61 @@ function AgentCoveragePanel({ agentMeta }: { agentMeta: AgentMetaEntry[] }) {
   );
 }
 
+function VideoValidationBanner({ validation }: { validation: VideoValidation }) {
+  if (validation.ok !== false) return null;
+  const missing = Array.isArray(validation.missing) ? validation.missing : [];
+  const invalid = Array.isArray(validation.invalid) ? validation.invalid : [];
+  const totalIssues = missing.length + invalid.length + (validation.error ? 1 : 0);
+  const samples = [...missing, ...invalid].slice(0, 4);
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: -6 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="glass-card rounded-2xl overflow-hidden border border-purple-500/25 bg-purple-500/[0.04]"
+    >
+      <div className="px-5 py-4 flex items-start gap-3">
+        <div className="w-9 h-9 rounded-lg bg-purple-500/15 border border-purple-500/30 flex items-center justify-center flex-shrink-0 mt-0.5">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#C4B5FD" strokeWidth="2.2">
+            <polygon points="23 7 16 12 23 17 23 7" />
+            <rect x="1" y="5" width="15" height="14" rx="2" />
+          </svg>
+        </div>
+        <div className="min-w-0">
+          <div className="text-[#DDD6FE] font-semibold text-[15px]">Video artifact validation failed</div>
+          <div className="text-[#F0F6FF]/85 text-sm mt-0.5">
+            {validation.error || `${totalIssues} video issue${totalIssues === 1 ? '' : 's'} found across executed tests.`}
+          </div>
+          <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+            <span className="px-2 py-0.5 rounded-md bg-purple-500/10 border border-purple-500/25 text-[#C4B5FD] text-[11px] font-mono">
+              videos: {validation.testsWithVideo ?? 0}/{validation.totalExecuted ?? 0} tests
+            </span>
+            <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+              mode: {validation.requiredForAllExecuted ? 'on' : 'retain-on-failure'}
+            </span>
+            {validation.videoCount !== undefined && (
+              <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                files: {validation.videoCount}
+              </span>
+            )}
+          </div>
+          {samples.length > 0 && (
+            <ul className="mt-2 space-y-1 font-mono text-[11px] text-[#D8E8FF]/75">
+              {samples.map((issue, idx) => (
+                <li key={`${issue.testName ?? 'video'}-${idx}`} className="truncate">
+                  <span className="text-[#C4B5FD]">{issue.reason ?? 'video_issue'}</span>
+                  {issue.testName && <span> · {issue.testName}</span>}
+                  {issue.path && <span className="text-[#8BA4C8]"> · {issue.path}</span>}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </div>
+    </motion.div>
+  );
+}
+
 function PartialGenerationBanner({
   warning,
   agentFailures,
@@ -2573,6 +2648,7 @@ export default function TestRunDetailPage() {
   const generationMeta = (report?.metadata?.generationMeta ?? null) as GenerationMetaShape | null;
   const partialWarning = generationMeta?.partialGenerationWarning ?? null;
   const qualityWarning = generationMeta?.qualityWarning ?? null;
+  const videoValidation = (report?.metadata?.videoValidation ?? generationMeta?.videoValidation ?? null) as VideoValidation | null;
   const agentFailuresFromMeta: AgentFailure[] = Array.isArray(generationMeta?.agentFailures)
     ? (generationMeta!.agentFailures as AgentFailure[])
     : [];
@@ -2787,6 +2863,10 @@ export default function TestRunDetailPage() {
 
       {!pipelineError && qualityWarning && qualityWarning.suggestions?.length > 0 && (
         <QualityWarningBanner warning={qualityWarning} />
+      )}
+
+      {!pipelineError && videoValidation?.ok === false && (
+        <VideoValidationBanner validation={videoValidation} />
       )}
 
       {Array.isArray(generationMeta?.agentMeta) && generationMeta!.agentMeta!.length > 0 && (

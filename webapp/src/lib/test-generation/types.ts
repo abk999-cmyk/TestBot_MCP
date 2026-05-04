@@ -255,6 +255,7 @@ export interface ParsedPRD {
 
 export interface Role {
   name: string                 // e.g. "admin", "user"
+  role?: string                // MCP compatibility: older runners send role instead of name
   storageStatePath?: string    // path to Playwright storageState JSON for this role
   loginVerified?: boolean
 }

@@ -14,8 +14,14 @@ class PlaywrightMCPClient {
       baseURL: config.baseURL || 'http://localhost:3000',
       timeout: config.timeout || 60000,
       strictWorkflowStepTypes: config.strictWorkflowStepTypes !== false,
+      videoMode: String(config.videoMode || process.env.HEALIX_VIDEO_MODE || 'on').trim().toLowerCase() === 'retain-on-failure'
+        ? 'retain-on-failure'
+        : 'on',
       ...config,
     };
+    this.config.videoMode = String(this.config.videoMode || '').trim().toLowerCase() === 'retain-on-failure'
+      ? 'retain-on-failure'
+      : 'on';
     
     this.mcpAvailable = false;
   }
@@ -1445,7 +1451,7 @@ module.exports = defineConfig({
     baseURL: process.env.BASE_URL || '${this.config.baseURL}',
     trace: 'retain-on-failure',
     screenshot: 'on',
-    video: 'retain-on-failure',
+    video: '${this.config.videoMode}',
   },
 
   projects: [

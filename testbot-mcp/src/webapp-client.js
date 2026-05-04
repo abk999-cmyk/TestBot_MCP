@@ -53,6 +53,8 @@ const ENDPOINT_TIMEOUTS_MS = {
   // Per-GET for job-status polling. The caller's overall poll budget
   // (pollGenerationJob's `timeoutMs`) is separate and typically minutes long.
   pollGenerationJob: 10_000,
+  nextSequentialAction: 180_000,
+  synthesizeSequentialSpec: 180_000,
 };
 
 // Backoff schedule for pollGenerationJob. Maps consecutive no-state-change
@@ -285,6 +287,40 @@ class WebappClient {
         options,
       },
       { timeoutMs: this._timeout('generateTestsForAgent') }
+    );
+  }
+
+  async nextSequentialAction({ testCase, observation, history, lastError, projectInfo, roles, options } = {}) {
+    this._assertKey('/api/test-turns/next-action');
+    return this._post(
+      '/api/test-turns/next-action',
+      {
+        api_key: this.apiKey,
+        testCase,
+        observation,
+        history: Array.isArray(history) ? history : [],
+        lastError: lastError || null,
+        projectInfo: projectInfo || {},
+        roles: roles || [],
+        options: options || {},
+      },
+      { timeoutMs: this._timeout('nextSequentialAction') }
+    );
+  }
+
+  async synthesizeSequentialSpec({ testCase, trace, projectInfo, roles, options } = {}) {
+    this._assertKey('/api/test-turns/synthesize-spec');
+    return this._post(
+      '/api/test-turns/synthesize-spec',
+      {
+        api_key: this.apiKey,
+        testCase,
+        trace,
+        projectInfo: projectInfo || {},
+        roles: roles || [],
+        options: options || {},
+      },
+      { timeoutMs: this._timeout('synthesizeSequentialSpec') }
     );
   }
 

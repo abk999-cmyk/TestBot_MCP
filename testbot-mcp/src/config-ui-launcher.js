@@ -37,6 +37,7 @@ const CONFIG_UI_PAYLOAD_SCHEMA = z.object({
   startCommand: z.string().min(1).max(500),
   generateTests: z.boolean(),
   openDashboard: z.boolean(),
+  videoMode: z.enum(['on', 'retain-on-failure']).optional(),
   credentials: z.union([
     CREDENTIAL_SCHEMA,
     z.array(CREDENTIAL_SCHEMA).max(10),
@@ -139,10 +140,12 @@ class ConfigUILauncher {
       testType: projectInfo.testType || 'both',
       generateTests: String(projectInfo.generateTests !== false),
       openDashboard: String(projectInfo.openDashboard !== false),
+      testStrategy: projectInfo.testStrategy || 'sequential',
       strictAIGeneration: String(projectInfo.strictAIGeneration !== false),
       minGeneratedTests: String(projectInfo.minGeneratedTests || 50),
       coverageProfile: projectInfo.coverageProfile || 'qa-max',
       phaseMode: projectInfo.phaseMode || 'two-phase',
+      videoMode: projectInfo.videoMode || 'on',
       serverPort: String(this.config.port),
     });
 

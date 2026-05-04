@@ -32,6 +32,7 @@ const ArtifactUploader = require('./artifact-uploader');
 const DashboardLauncher = require('./dashboard-launcher');
 const AIAnalyzer = require('./ai-providers/index');
 const WebappClient = require('./webapp-client');
+const { runSequentialGeneration } = require('./sequential-runner');
 const { startSecondaryServices, stopSecondaryServices, probeHttpReady, waitForServiceReady } = require('./multi-service-starter');
 const { runExplorationPhase, EMPTY_ARTIFACT } = require('./exploration-phase');
 const { injectCredentials } = require('./credentials-injector');
@@ -1195,6 +1196,11 @@ function isVideoCursorEnabled(config = {}) {
   return !['0', 'false', 'off', 'no'].includes(envValue);
 }
 
+function resolveVideoMode(value) {
+  const raw = String(value || process.env.HEALIX_VIDEO_MODE || 'on').trim().toLowerCase();
+  return raw === 'retain-on-failure' ? 'retain-on-failure' : 'on';
+}
+
 function toImportPath(relativePath) {
   const normalized = String(relativePath || '').replace(/\\/g, '/');
   if (!normalized || normalized === '.') {
@@ -1625,8 +1631,9 @@ function safeWriteGeneratedTest(testsDir, test, index, fallbackPrefix, usedFilen
   };
 }
 
-function writeSupplementalAuthConfig(projectPath, baseURL, verifiedRoles) {
+function writeSupplementalAuthConfig(projectPath, baseURL, verifiedRoles, options = {}) {
   if (!verifiedRoles || verifiedRoles.length === 0) return null;
+  const videoMode = resolveVideoMode(options.videoMode);
   const tierBProjects = verifiedRoles.map((r) => `    {
       name: 'tierB-auth-${String(r.role || 'user').replace(/[^a-zA-Z0-9_-]/g, '_')}',
       grep: /@auth|@tierB/,
@@ -1658,7 +1665,7 @@ export default defineConfig({
     baseURL: '${baseURL}',
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
-    video: 'retain-on-failure',
+    video: '${videoMode}',
   },
   projects: [
 ${tierBProjects}
@@ -1682,7 +1689,8 @@ ${tierBProjects}
   }
 }
 
-function ensurePlaywrightConfig(projectPath, projectInfo = {}, roles = []) {
+function ensurePlaywrightConfig(projectPath, projectInfo = {}, roles = [], options = {}) {
+  const videoMode = resolveVideoMode(options.videoMode);
   const candidates = [
     'playwright.config.ts',
     'playwright.config.js',
@@ -1711,7 +1719,7 @@ function ensurePlaywrightConfig(projectPath, projectInfo = {}, roles = []) {
       if (verifiedRolesSummary.length > 0) {
         const verifiedRoles = (roles || []).filter((r) => r && r.loginVerified && r.storageStatePath);
         const baseURL = projectInfo.baseURL || 'http://localhost:3000';
-        supplementalAuthConfigPath = writeSupplementalAuthConfig(projectPath, baseURL, verifiedRoles);
+        supplementalAuthConfigPath = writeSupplementalAuthConfig(projectPath, baseURL, verifiedRoles, { videoMode });
       }
       // INFO (not debug): the user needs to see this because any tierB-auth
       // projects we would have wired up are being skipped — their @auth-tagged
@@ -1798,7 +1806,7 @@ export default defineConfig({
     baseURL: '${baseURL}',
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
-    video: 'retain-on-failure',
+    video: '${videoMode}',
   },
   projects: [
 ${projectsBlock}
@@ -2364,24 +2372,95 @@ function installMissingDependencies(projectPath, testsDir) {
  * backend still gets `smoke` because the existing smoke generator emits
  * backend smokes too when applicable.
  */
-function pickAgentsForRun(testType, projectInfo = {}) {
+function pickAgentsForRun(
+  testType,
+  projectInfo = {},
+  context = {},
+  parsedPRD = null,
+  explorationArtifact = null,
+  options = {},
+) {
   const apiOnly = projectInfo && projectInfo.apiOnly === true;
-  if (apiOnly) return ['api'];
+  const addUnique = (agents, agent) => {
+    if (!agents.includes(agent)) agents.push(agent);
+  };
 
-  const agents = ['smoke'];
-  if (testType === 'frontend' || testType === 'both' || !testType) {
-    agents.push('frontend');
+  if (apiOnly) {
+    const agents = ['api'];
+    if (options.includeErrorStates && Array.isArray(context.errorScenarios) && context.errorScenarios.length > 0) {
+      agents.push('error');
+    }
+    return agents;
   }
-  if (testType === 'backend' || testType === 'both' || !testType) {
-    agents.push('api');
+
+  const normalizedTestType = testType || 'both';
+  const agents = [];
+  if (options.includeSmoke !== false) {
+    agents.push('smoke');
   }
-  // workflow + error are UI-driven (skipped under apiOnly above); they still
-  // run for backend testType because they exercise end-to-end flows that
-  // may hit a UI. The webapp does its own membership check — if the
-  // project has no workflows/errorScenarios, its branch is skipped and it
-  // returns [] fast.
-  agents.push('workflow', 'error');
-  return agents;
+
+  if (normalizedTestType === 'frontend' || normalizedTestType === 'both') {
+    if (
+      (Array.isArray(context.pages) && context.pages.length > 0) ||
+      context.navigationGraph ||
+      parsedPRD ||
+      explorationArtifact
+    ) {
+      addUnique(agents, 'frontend');
+    }
+  }
+
+  if (normalizedTestType === 'backend' || normalizedTestType === 'both') {
+    if ((Array.isArray(context.apiEndpoints) && context.apiEndpoints.length > 0) || parsedPRD) {
+      addUnique(agents, 'api');
+    }
+  }
+
+  if (options.includeWorkflows !== false && Array.isArray(context.workflows) && context.workflows.length > 0) {
+    addUnique(agents, 'workflow');
+  }
+
+  if (options.includeErrorStates && Array.isArray(context.errorScenarios) && context.errorScenarios.length > 0) {
+    addUnique(agents, 'error');
+  }
+
+  return agents.length > 0 ? agents : ['smoke'];
+}
+
+function buildAgentHealth({ agents = [], agentsCompleted = [], agentFailures = [], files = [] } = {}) {
+  const agentsRequested = [...new Set((agents || []).filter(Boolean))];
+  const completed = [...new Set((agentsCompleted || []).filter(Boolean))];
+  const failures = (agentFailures || [])
+    .filter(Boolean)
+    .map((failure) => ({
+      agent: failure.agent || 'unknown',
+      code: failure.code || null,
+      message: failure.message || '',
+    }));
+  const failureSet = new Set(failures.map((failure) => failure.agent));
+  const completedSet = new Set(completed);
+  const missingAgents = agentsRequested.filter((agent) => !completedSet.has(agent) && !failureSet.has(agent));
+  const filesByAgent = {};
+  for (const file of files || []) {
+    const agent = file?.agent || 'unknown';
+    filesByAgent[agent] = (filesByAgent[agent] || 0) + 1;
+  }
+  const totalFiles = Array.isArray(files) ? files.length : 0;
+  const allAgentsFailed = agentsRequested.length > 0 &&
+    totalFiles === 0 &&
+    agentsRequested.every((agent) => failureSet.has(agent));
+
+  return {
+    ok: missingAgents.length === 0 && !allAgentsFailed,
+    agentsRequested,
+    agentsCompleted: completed,
+    agentFailures: failures,
+    missingAgents,
+    filesByAgent,
+    totalFiles,
+    partialSuccess: totalFiles > 0 && (failures.length > 0 || missingAgents.length > 0),
+    allAgentsFailed,
+  };
 }
 
 async function maybeGenerateViaSaaS({
@@ -2460,7 +2539,14 @@ async function maybeGenerateViaSaaS({
     },
   };
 
-  const agents = pickAgentsForRun(config.testType, projectInfo);
+  const agents = pickAgentsForRun(
+    config.testType,
+    projectInfo,
+    context,
+    parsedPRD,
+    explorationArtifact,
+    sharedPayload.options,
+  );
 
   // ── P1.5 planner pre-pass ────────────────────────────────────────────────
   // One HTTP call to /api/generate-tests/plan BEFORE the fan-out. The plan
@@ -2755,10 +2841,25 @@ async function runPhase1FanOut({
     agentFailures: agentFailures.map((f) => `${f.agent}:${f.code}`),
   });
 
+  const agentHealth = buildAgentHealth({
+    agents,
+    agentsCompleted,
+    agentFailures,
+    files,
+  });
+
+  if (agentHealth.missingAgents.length > 0) {
+    const err = new Error(`Agent accounting incomplete: ${agentHealth.missingAgents.join(', ')} did not complete or fail`);
+    err.code = 'AGENT_ACCOUNTING_INCOMPLETE';
+    err.agentFailures = agentFailures;
+    err.agentHealth = agentHealth;
+    throw err;
+  }
+
   // Hard fail only if every agent rejected AND nothing landed on disk.
   // Partial-success path: even a single agent's tests is enough to keep
   // the pipeline alive — validation + execution will run on what we have.
-  if (files.length === 0 && rejected === agents.length) {
+  if (agentHealth.allAgentsFailed || (files.length === 0 && rejected === agents.length)) {
     const firstFailure = agentFailures[0];
     const err = new Error(
       `All ${agents.length} agent generations failed` +
@@ -2766,6 +2867,7 @@ async function runPhase1FanOut({
     );
     err.code = firstFailure?.code || 'GENERATION_FAILED';
     err.agentFailures = agentFailures;
+    err.agentHealth = agentHealth;
     throw err;
   }
 
@@ -2787,6 +2889,7 @@ async function runPhase1FanOut({
     );
     err.code = 'AGENTS_RETURNED_ZERO_TESTS';
     err.agentFailures = agentFailures;
+    err.agentHealth = agentHealth;
     throw err;
   }
 
@@ -2803,6 +2906,8 @@ async function runPhase1FanOut({
       agentsRequested: agents,
       agentsCompleted,
       agentFailures,
+      agentHealth,
+      filesByAgent: agentHealth.filesByAgent,
       partialsWrittenCount: files.length,
       plannedTests: plan?.totalPlannedTests ?? 0,
       planStatus: planMeta?.status || null,
@@ -2896,6 +3001,20 @@ async function runAsyncGenerationPath({
       }
 
       installMissingDependencies(config.projectPath, testsDir);
+      const completedFromPayload = Array.isArray(syncPayload.agentsCompleted)
+        ? syncPayload.agentsCompleted
+            .map((a) => (typeof a === 'string' ? a : a?.agent))
+            .filter(Boolean)
+        : [];
+      const completedAgents = completedFromPayload.length > 0
+        ? completedFromPayload
+        : [...new Set(files.map((file) => file.agent).filter(Boolean))];
+      const agentHealth = buildAgentHealth({
+        agents,
+        agentsCompleted: completedAgents.length > 0 ? completedAgents : agents,
+        agentFailures: [],
+        files,
+      });
 
       return {
         generated: files.length,
@@ -2904,8 +3023,10 @@ async function runAsyncGenerationPath({
         generationMeta: {
           chunkingStrategy: 'async_sync_fallback',
           agentsRequested: agents,
-          agentsCompleted: [],
+          agentsCompleted: agentHealth.agentsCompleted,
           agentFailures: [],
+          agentHealth,
+          filesByAgent: agentHealth.filesByAgent,
           partialsWrittenCount: files.length,
           plannedTests: plan?.totalPlannedTests ?? 0,
           planStatus: planMeta?.status || null,
@@ -3035,10 +3156,26 @@ async function runAsyncGenerationPath({
         .filter(Boolean)
     : [];
 
+  const agentHealth = buildAgentHealth({
+    agents: agentsRequestedList,
+    agentsCompleted: agentsCompletedList,
+    agentFailures,
+    files,
+  });
+
+  if (agentHealth.missingAgents.length > 0) {
+    const err = new Error(`Async agent accounting incomplete: ${agentHealth.missingAgents.join(', ')} did not complete or fail`);
+    err.code = 'AGENT_ACCOUNTING_INCOMPLETE';
+    err.agentFailures = agentFailures;
+    err.agentHealth = agentHealth;
+    err.jobId = jobId;
+    throw err;
+  }
+
   // Hard fail only if the orchestrator says failed AND nothing landed on
   // disk. Matches Phase-1 behavior: any partial survives; only an empty
   // total-failure throws.
-  if (finalResp?.status === 'failed' && files.length === 0) {
+  if ((finalResp?.status === 'failed' && files.length === 0) || agentHealth.allAgentsFailed) {
     const firstFailure = agentFailures[0];
     const err = new Error(
       `Async generation job failed (jobId=${jobId})` +
@@ -3048,6 +3185,7 @@ async function runAsyncGenerationPath({
     err.agentFailures = agentFailures.length > 0
       ? agentFailures
       : [{ agent: 'unknown', code: 'ALL_AGENTS_FAILED', message: err.message }];
+    err.agentHealth = agentHealth;
     err.jobId = jobId;
     throw err;
   }
@@ -3066,6 +3204,8 @@ async function runAsyncGenerationPath({
       agentsRequested: agentsRequestedList,
       agentsCompleted: agentsCompletedList,
       agentFailures,
+      agentHealth,
+      filesByAgent: agentHealth.filesByAgent,
       partialsWrittenCount: files.length,
       plannedTests: plan?.totalPlannedTests ?? 0,
       planStatus: planMeta?.status || null,
@@ -3830,7 +3970,8 @@ async function runPipeline(config, runId) {
       config.skipExploration === true
       || process.env.HEALIX_SKIP_EXPLORATION === '1';
 
-    if (!explorationSkipped && config.startCommand && config.baseURL) {
+    const sequentialStrategy = String(config.testStrategy || process.env.HEALIX_TEST_STRATEGY || 'sequential').toLowerCase() === 'sequential';
+    if ((sequentialStrategy || !explorationSkipped) && config.startCommand && config.baseURL) {
       const alreadyUp = await probeHttpReady(config.baseURL);
       if (alreadyUp) {
         Logger.info('PipelineWorker', 'Primary app already running — reusing for exploration', { url: config.baseURL });
@@ -3989,28 +4130,54 @@ async function runPipeline(config, runId) {
     if (config.generateTests) {
       updateStatus(statusDir, 'generating', {
         runId,
-        message: 'Generating tests...',
+        message: sequentialStrategy
+          ? 'Running sequential tester and synthesizing tests...'
+          : 'Generating tests...',
         aiOnlyEnforced,
+        testStrategy: sequentialStrategy ? 'sequential' : 'script',
       }, telemetryReporter);
 
-      const generationResult = await generateWithFallbackChain({
-        config,
-        context: codebaseContext,
-        prdContent: combinedPrdContent,
-        parsedPRD,
-        explorationArtifact,
-        roles,
-        runBudget,
-        projectInfo,
-        statusDir,
-        runId,
-      });
+      const generationResult = sequentialStrategy
+        ? await withStageBudget(runBudget, 'generation', async () => {
+            const testsDir = resetGeneratedTestsDir(config.projectPath);
+            const client = process.env.HEALIX_API_KEY
+              ? new WebappClient({ apiKey: process.env.HEALIX_API_KEY })
+              : null;
+            return runSequentialGeneration({
+              config,
+              context: codebaseContext,
+              parsedPRD,
+              explorationArtifact,
+              roles,
+              projectInfo,
+              testsDir,
+              statusDir,
+              runId,
+              client,
+              telemetryReporter,
+              updateStatus,
+            });
+          })
+        : await generateWithFallbackChain({
+            config,
+            context: codebaseContext,
+            prdContent: combinedPrdContent,
+            parsedPRD,
+            explorationArtifact,
+            roles,
+            runBudget,
+            projectInfo,
+            statusDir,
+            runId,
+          });
 
       generationMeta = generationResult.generationMeta;
       fallbackUsed = !!generationMeta?.fallbackUsed;
 
       // Ensure playwright.config.ts exists after test generation
-      const playwrightConfigResult = ensurePlaywrightConfig(config.projectPath, projectInfo, roles);
+      const playwrightConfigResult = ensurePlaywrightConfig(config.projectPath, projectInfo, roles, {
+        videoMode: config.videoMode,
+      });
       if (generationMeta && playwrightConfigResult) {
         generationMeta.playwrightConfig = playwrightConfigResult;
       }
@@ -4023,8 +4190,15 @@ async function runPipeline(config, runId) {
         prdContents,
         projectPath: config.projectPath,
       });
+      const qualityGateConfig = sequentialStrategy
+        ? {
+            ...config,
+            minGeneratedTests: Math.max(1, Math.min(toFiniteNumber(config.minGeneratedTests, 50), generationResult.generated || 1)),
+            coverageProfile: config.coverageProfile === 'exhaustive' ? 'qa-max' : (config.coverageProfile || 'balanced'),
+          }
+        : config;
       const qualityGate = evaluateGenerationQualityGates({
-        config,
+        config: qualityGateConfig,
         context: codebaseContext || {},
         quality: qualityScan,
         prdContent: combinedPrdContent,
@@ -4261,7 +4435,7 @@ async function runPipeline(config, runId) {
     // "Timed out waiting 120000ms from config.webServer". Detect the mismatch
     // upfront and throw an actionable error instead of burning 2 minutes.
     try {
-      if (config.startCommand && config.baseURL) {
+      if (config.startCommand && config.baseURL && config.generateTests === false) {
         const conflict = detectPlaywrightWebServerConflict(config.projectPath, config.baseURL);
         if (conflict) {
           const err = new Error(
@@ -4284,6 +4458,7 @@ async function runPipeline(config, runId) {
       ...config,
       timeout: executionTimeout,
       serverPidFile,
+      useHealixPlaywrightConfig: config.generateTests !== false,
       onTestProgress: telemetryReporter && telemetryReporter.isEnabled() ? onTestProgress : undefined,
       // Emit a `dev_server_ready` telemetry event once the primary dev server
       // responds (HTTP 2xx/3xx/4xx or TCP fallback). Downstream consumers use
@@ -4399,6 +4574,39 @@ async function runPipeline(config, runId) {
       Logger.warn('PipelineWorker', 'Failed to compute tier results', { reason: tierErr.message });
     }
 
+    const effectiveVideoMode = resolveVideoMode(config.videoMode);
+    let videoValidation = null;
+    try {
+      const artifactValidator = new ArtifactUploader({
+        projectPath: config.projectPath,
+        artifactMode: config.artifactMode,
+        videoMode: effectiveVideoMode,
+      });
+      videoValidation = artifactValidator.validateVideoArtifacts(testResults, {
+        requireForAllExecuted: effectiveVideoMode === 'on',
+      });
+      testResults.videoValidation = videoValidation;
+      if (generationMeta) {
+        generationMeta.videoValidation = videoValidation;
+        generationMeta.videoMode = effectiveVideoMode;
+      }
+      if (!videoValidation.ok) {
+        Logger.warn('PipelineWorker', 'Playwright video artifact validation found issues', videoValidation);
+      }
+    } catch (videoErr) {
+      videoValidation = {
+        ok: false,
+        requiredForAllExecuted: effectiveVideoMode === 'on',
+        error: videoErr.message,
+      };
+      testResults.videoValidation = videoValidation;
+      if (generationMeta) {
+        generationMeta.videoValidation = videoValidation;
+        generationMeta.videoMode = effectiveVideoMode;
+      }
+      Logger.warn('PipelineWorker', 'Failed to validate Playwright video artifacts', { reason: videoErr.message });
+    }
+
     updateStatus(statusDir, 'tests_complete', {
       runId,
       message: `Tests completed: ${testResults.passed}/${testResults.total} passed`,
@@ -4415,6 +4623,7 @@ async function runPipeline(config, runId) {
       generationQuality,
       requirementsCoverage,
       phaseResults,
+      videoValidation,
     }, telemetryReporter);
 
     if (telemetryReporter && telemetryReporter.isEnabled() && Array.isArray(testResults.tests) && testResults.tests.length > 0) {
@@ -4461,6 +4670,7 @@ async function runPipeline(config, runId) {
           passed: testResults.passed,
           failed: testResults.failed,
           skipped: testResults.skipped,
+          videoValidation,
         },
       });
     }
@@ -4503,6 +4713,7 @@ async function runPipeline(config, runId) {
       generationQuality,
       requirementsCoverage,
       phaseResults,
+      videoValidation,
     }, telemetryReporter);
 
     const report = await withStageBudget(runBudget, 'reporting', async () => {
@@ -4537,21 +4748,25 @@ async function runPipeline(config, runId) {
     Logger.info('PipelineWorker', `Using run ID for artifact upload: ${actualRunId}`);
 
     // -------------------------------------------------------
-    // 7. Upload artifacts for failed tests to Supabase Storage
+    // 7. Upload artifacts to Supabase Storage
     // -------------------------------------------------------
     // NOTE: This runs AFTER report generation so artifacts are copied to healix-reports/artifacts
     let artifactUploadResult = null;
-    if (testResults.failed > 0) {
+    const shouldUploadArtifacts = testResults.failed > 0 || effectiveVideoMode === 'on';
+    if (shouldUploadArtifacts) {
       try {
         updateStatus(statusDir, 'uploading_artifacts', {
           runId,
-          message: 'Uploading failure artifacts to storage...',
+          message: effectiveVideoMode === 'on'
+            ? 'Uploading test video artifacts to storage...'
+            : 'Uploading failure artifacts to storage...',
           generationMeta,
           fallbackUsed,
           aiOnlyEnforced,
           generationQuality,
           requirementsCoverage,
           phaseResults,
+          videoValidation,
         }, telemetryReporter);
 
         updateStatus(statusDir, 'uploading_artifacts', {
@@ -4563,12 +4778,15 @@ async function runPipeline(config, runId) {
           generationQuality,
           requirementsCoverage,
           phaseResults,
+          videoValidation,
         }, telemetryReporter);
 
         const artifactUploader = new ArtifactUploader({
           projectPath: config.projectPath,
           dashboardUrl: process.env.HEALIX_DASHBOARD_URL,
           apiKey: process.env.HEALIX_API_KEY,
+          artifactMode: config.artifactMode,
+          videoMode: effectiveVideoMode,
         });
 
         artifactUploadResult = await artifactUploader.processAndUpload(actualRunId, testResults);
@@ -4590,6 +4808,7 @@ async function runPipeline(config, runId) {
             generationQuality,
             requirementsCoverage,
             phaseResults,
+            videoValidation,
           }, telemetryReporter);
         } else {
           Logger.warn('PipelineWorker', 'Artifact upload failed', { reason: artifactUploadResult.reason });
@@ -4604,6 +4823,7 @@ async function runPipeline(config, runId) {
             generationQuality,
             requirementsCoverage,
             phaseResults,
+            videoValidation,
           }, telemetryReporter);
         }
       } catch (uploadError) {
@@ -4618,10 +4838,11 @@ async function runPipeline(config, runId) {
           generationQuality,
           requirementsCoverage,
           phaseResults,
+          videoValidation,
         }, telemetryReporter);
       }
     } else {
-      Logger.info('PipelineWorker', 'No failed tests - skipping artifact upload');
+      Logger.info('PipelineWorker', 'No failed tests and videoMode is not on - skipping artifact upload');
     }
 
     // -------------------------------------------------------
@@ -4671,6 +4892,7 @@ async function runPipeline(config, runId) {
       generationQuality,
       requirementsCoverage,
       phaseResults,
+      videoValidation,
       budget: {
         totalMs: runBudget.totalMs,
         consumedMs: getBudgetElapsedMs(runBudget),
@@ -4914,8 +5136,10 @@ module.exports = {
   getCursorFixtureContent,
   ensureCursorFixtureFiles,
   ensureHealixFixtureImports,
+  applyMouseCursorOverlayToGeneratedTests,
   ensurePlaywrightConfig,
   writeSupplementalAuthConfig,
+  buildAgentHealth,
   createRunBudget,
   DEFAULT_STAGE_CAPS_MS,
   DEFAULT_TOTAL_BUDGET_MS,

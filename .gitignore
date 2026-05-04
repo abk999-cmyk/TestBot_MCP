@@ -26,6 +26,7 @@ build/
 # IDE
 .idea/
 .vscode/
+.cursor/mcp.json
 *.swp
 *.swo
 .DS_Store

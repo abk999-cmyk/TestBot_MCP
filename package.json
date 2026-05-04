@@ -5,9 +5,9 @@
   "main": "index.js",
   "scripts": {
     "dev:webapp": "npm run dev -w webapp",
-    "start:testbot": "npm start -w @testbot/mcp",
+    "start:testbot": "npm start -w @healix/mcp",
     "test:webapp": "npm run test -w webapp",
-    "test:testbot": "npm run test -w @testbot/mcp"
+    "test:testbot": "npm run test -w @healix/mcp"
   },
   "workspaces": [
     "testbot-mcp",

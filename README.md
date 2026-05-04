@@ -63,7 +63,7 @@ The pipeline runs automatically:
 
 | Tool | Description |
 |------|-------------|
-| `healix_test_my_app` | Full end-to-end pipeline. Accepts `projectPath`, `baseURL`, `port`, `startCommand`, `testType` (`frontend`/`backend`/`both`), `prdFile`, `generateTests`, `openDashboard`, `credentials`, `codebaseContext`, `playwrightMcp`, and more. |
+| `healix_test_my_app` | Full end-to-end pipeline. Accepts `projectPath`, `baseURL`, `port`, `startCommand`, `testType` (`frontend`/`backend`/`both`), `testStrategy` (`sequential`/`script`), `prdFile`, `generateTests`, `openDashboard`, `credentials`, `codebaseContext`, `playwrightMcp`, and more. |
 | `healix_configure` | Opens the config UI and returns validated settings without running the pipeline. Useful for pre-flight checks. |
 
 ## Configuration
@@ -93,6 +93,7 @@ Copy `.env.example` to `webapp/.env.local`:
 | `OPENAI_API_KEY` | OpenAI API key. Used only by webapp API routes — never by the MCP. |
 | `OPENAI_MODEL` | Model override (default: `gpt-4o`). |
 | `HEALIX_GEN_ASYNC` | `true` routes `/api/generate-tests` through Inngest background jobs. Default: `false`. |
+| `HEALIX_TEST_STRATEGY` | `sequential` runs live turn-by-turn testing before synthesizing specs; `script` uses legacy full-spec generation. Default: `sequential`. |
 | `INNGEST_EVENT_KEY` | Inngest event key (required only when `HEALIX_GEN_ASYNC=true`). |
 | `INNGEST_SIGNING_KEY` | Inngest webhook signing key (required only when `HEALIX_GEN_ASYNC=true`). |
 | `INNGEST_DEV` | Set `1` when running against the local `inngest-cli`. |

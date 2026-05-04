@@ -46,6 +46,37 @@ function ensureAuthDir(projectPath) {
   return dir;
 }
 
+function loginUrlCandidates(baseURL, authFlow = null) {
+  const candidates = [];
+  if (authFlow?.loginUrl) candidates.push(new URL(authFlow.loginUrl, baseURL).toString());
+  for (const pathname of ['/login', '/signin', '/sign-in', '/auth/login', '/admin/login', '/']) {
+    try {
+      candidates.push(new URL(pathname, baseURL).toString());
+    } catch {
+      // ignore malformed fallback
+    }
+  }
+  return Array.from(new Set(candidates));
+}
+
+async function openFirstLoginForm(page, { baseURL, authFlow, userField }) {
+  const candidates = loginUrlCandidates(baseURL, authFlow);
+  let lastError = null;
+  for (const loginUrl of candidates) {
+    try {
+      await page.goto(loginUrl, { waitUntil: 'load', timeout: 30_000 });
+      await page.locator(userField).first().waitFor({ state: 'visible', timeout: 7_500 });
+      return {
+        loginUrl,
+        loginPathname: (() => { try { return new URL(loginUrl).pathname; } catch { return loginUrl; } })(),
+      };
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError || new Error(`No login form found at candidates: ${candidates.join(', ')}`);
+}
+
 /**
  * Drive a login with Playwright. Returns true if post-login state shows the
  * `successIndicator` and not the `failureIndicator`. We use Playwright via
@@ -64,20 +95,16 @@ async function driveLogin({ baseURL, authFlow, credentials, storageStatePath }) 
   const page = await context.newPage();
 
   try {
-    const loginUrl = authFlow?.loginUrl
-      ? new URL(authFlow.loginUrl, baseURL).toString()
-      : baseURL;
-    const loginPathname = (() => { try { return new URL(loginUrl).pathname; } catch { return loginUrl; } })();
-
-    // Use `load` not `networkidle` — Next.js/Supabase apps have persistent background
-    // fetches that can prevent networkidle from firing within any reasonable timeout.
-    await page.goto(loginUrl, { waitUntil: 'load', timeout: 30_000 });
-
     const userField = authFlow?.credentialFields?.username || 'input[type="email"], input[name="email"], input[name="username"]';
     const passField = authFlow?.credentialFields?.password || 'input[type="password"], input[name="password"]';
 
-    // Wait for the input to be visible — JS-rendered forms appear after hydration.
-    await page.locator(userField).first().waitFor({ state: 'visible', timeout: 15_000 });
+    // Use `load` not `networkidle` — Next.js/Supabase apps have persistent background
+    // fetches that can prevent networkidle from firing within any reasonable timeout.
+    // When exploration did not discover authFlow, try common login routes before
+    // falling back to the app root. Treating baseURL as the login page is what
+    // caused every downstream auth-gated test to fail on apps with /login routes.
+    const { loginPathname } = await openFirstLoginForm(page, { baseURL, authFlow, userField });
+
     await page.fill(userField, credentials.username, { timeout: 10_000 });
     await page.fill(passField, credentials.password, { timeout: 10_000 });
 
@@ -159,4 +186,5 @@ module.exports = {
   injectCredentials,
   authDirFor,
   stateFileFor,
+  loginUrlCandidates,
 };

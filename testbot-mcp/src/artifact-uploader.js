@@ -54,8 +54,13 @@ class ArtifactUploader {
       projectPath: config.projectPath || process.cwd(),
       dashboardUrl: config.dashboardUrl || process.env.HEALIX_DASHBOARD_URL || 'http://localhost:3000',
       apiKey: config.apiKey || process.env.HEALIX_API_KEY,
+      artifactMode: config.artifactMode || 'hybrid',
+      videoMode: config.videoMode || process.env.HEALIX_VIDEO_MODE || 'on',
       ...config,
     };
+    this.config.videoMode = String(this.config.videoMode || '').trim().toLowerCase() === 'retain-on-failure'
+      ? 'retain-on-failure'
+      : 'on';
     
     Logger.info('ArtifactUploader', 'Initialized with config:', {
       projectPath: this.config.projectPath,
@@ -65,31 +70,44 @@ class ArtifactUploader {
     });
   }
 
-  /**
-   * Collect artifacts from test results (already parsed by playwright-integration)
-   * Only collects artifacts for failed tests
-   */
-  collectFailureArtifacts(testResults) {
+  resolveArtifactPath(filePath) {
+    if (!filePath) return null;
+    const rawPath = String(filePath);
+    if (path.isAbsolute(rawPath)) return rawPath;
+
+    const projectRelative = path.resolve(this.config.projectPath, rawPath);
+    if (fs.existsSync(projectRelative)) return projectRelative;
+
+    return path.resolve(process.cwd(), rawPath);
+  }
+
+  isExecutedTest(test) {
+    const status = String(test?.status || test?.outcome || '').toLowerCase();
+    return status !== 'skipped' && status !== 'pending';
+  }
+
+  collectArtifacts(testResults, options = {}) {
     const artifacts = [];
+    const includePassed = options.includePassed === true;
+    const selectedTests = (testResults.tests || [])
+      .filter((test) => includePassed ? this.isExecutedTest(test) : String(test.status || '').toLowerCase() === 'failed');
     
     Logger.info('ArtifactUploader', 'Starting artifact collection', {
       totalTests: testResults.tests?.length || 0,
-      failedCount: (testResults.tests || []).filter(t => t.status === 'failed').length
+      failedCount: (testResults.tests || []).filter(t => t.status === 'failed').length,
+      selectedCount: selectedTests.length,
+      includePassed,
     });
-    
-    // Get failed tests with their artifacts
-    const failedTests = (testResults.tests || [])
-      .filter(t => t.status === 'failed');
-    
-    if (failedTests.length === 0) {
-      Logger.warn('ArtifactUploader', 'No failed tests found, skipping artifact collection');
+
+    if (selectedTests.length === 0) {
+      Logger.warn('ArtifactUploader', 'No matching executed tests found, skipping artifact collection', { includePassed });
       return artifacts;
     }
 
-    Logger.info('ArtifactUploader', `Collecting artifacts for ${failedTests.length} failed tests`);
+    Logger.info('ArtifactUploader', `Collecting artifacts for ${selectedTests.length} test(s)`);
 
     // Extract artifacts from test results (already parsed by playwright-integration)
-    for (const test of failedTests) {
+    for (const test of selectedTests) {
       const testName = test.title || test.name || 'unknown-test';
       const testArtifacts = test.artifacts || {};
       
@@ -101,7 +119,7 @@ class ArtifactUploader {
       
       // Process screenshots
       for (const screenshot of testArtifacts.screenshots || []) {
-        const screenshotPath = screenshot.fullPath || screenshot.path;
+        const screenshotPath = this.resolveArtifactPath(screenshot.fullPath || screenshot.path);
         Logger.debug('ArtifactUploader', `Checking screenshot: ${screenshotPath}`);
         if (screenshotPath && fs.existsSync(screenshotPath)) {
           artifacts.push({
@@ -118,7 +136,7 @@ class ArtifactUploader {
       
       // Process videos
       for (const video of testArtifacts.videos || []) {
-        const videoPath = video.fullPath || video.path;
+        const videoPath = this.resolveArtifactPath(video.fullPath || video.path);
         Logger.debug('ArtifactUploader', `Checking video: ${videoPath}`);
         if (videoPath && fs.existsSync(videoPath)) {
           artifacts.push({
@@ -135,7 +153,7 @@ class ArtifactUploader {
       
       // Process traces
       for (const trace of testArtifacts.traces || []) {
-        const tracePath = trace.fullPath || trace.path;
+        const tracePath = this.resolveArtifactPath(trace.fullPath || trace.path);
         Logger.debug('ArtifactUploader', `Checking trace: ${tracePath}`);
         if (tracePath && fs.existsSync(tracePath)) {
           artifacts.push({
@@ -165,25 +183,88 @@ class ArtifactUploader {
       Logger.info('ArtifactUploader', `Deny-list removed ${beforeDeny - artifacts.length} credential file(s)`);
     }
 
-    Logger.info('ArtifactUploader', `Collected ${artifacts.length} artifacts from ${failedTests.length} failed tests via test.artifacts`);
+    Logger.info('ArtifactUploader', `Collected ${artifacts.length} artifacts from ${selectedTests.length} test(s) via test.artifacts`);
     
     // ALWAYS try filesystem fallback if no artifacts found from test.artifacts
-    if (artifacts.length === 0 && failedTests.length > 0) {
+    if (artifacts.length === 0 && selectedTests.length > 0) {
       Logger.warn('ArtifactUploader', 'No artifacts found via test.artifacts property, scanning filesystem...');
-      // Pass failed tests so we can map directory names to actual test titles
+      // Pass selected tests so we can map directory names to actual test titles.
       const testTitleMap = {};
-      for (const test of failedTests) {
+      for (const test of selectedTests) {
         const title = test.title || test.name || 'unknown-test';
         // Create a normalized key from the title for matching
         const normalizedKey = title.toLowerCase().replace(/[^a-z0-9]/g, '');
         testTitleMap[normalizedKey] = title;
       }
-      const fsArtifacts = this.collectFromFilesystem(failedTests, testTitleMap);
+      const fsArtifacts = this.collectFromFilesystem(selectedTests, testTitleMap);
       Logger.info('ArtifactUploader', `Filesystem scan found ${fsArtifacts.length} artifacts`);
       return fsArtifacts;
     }
     
     return artifacts;
+  }
+
+  /**
+   * Collect artifacts from failed tests only. Kept for legacy callers/tests.
+   */
+  collectFailureArtifacts(testResults) {
+    return this.collectArtifacts(testResults, { includePassed: false });
+  }
+
+  validateVideoArtifacts(testResults, options = {}) {
+    const requireForAllExecuted = options.requireForAllExecuted === true;
+    const executedTests = (testResults.tests || []).filter((test) => this.isExecutedTest(test));
+    const missing = [];
+    const invalid = [];
+    let testsWithVideo = 0;
+    let videoCount = 0;
+
+    for (const test of executedTests) {
+      const testName = test.title || test.name || 'unknown-test';
+      const videos = Array.isArray(test.artifacts?.videos) ? test.artifacts.videos : [];
+      if (videos.length > 0) {
+        testsWithVideo += 1;
+      } else if (requireForAllExecuted) {
+        missing.push({
+          testName,
+          status: test.status || 'unknown',
+          reason: 'missing_video_attachment',
+        });
+      }
+
+      for (const video of videos) {
+        videoCount += 1;
+        const videoPath = this.resolveArtifactPath(video.fullPath || video.path);
+        if (!videoPath || !fs.existsSync(videoPath)) {
+          invalid.push({
+            testName,
+            path: video.fullPath || video.path || null,
+            reason: 'missing_file',
+          });
+          continue;
+        }
+
+        const stats = fs.statSync(videoPath);
+        if (stats.size <= 0) {
+          invalid.push({
+            testName,
+            path: videoPath,
+            reason: 'zero_byte_file',
+            size: stats.size,
+          });
+        }
+      }
+    }
+
+    return {
+      ok: missing.length === 0 && invalid.length === 0,
+      requiredForAllExecuted: requireForAllExecuted,
+      totalExecuted: executedTests.length,
+      testsWithVideo,
+      videoCount,
+      missing,
+      invalid,
+    };
   }
   
   /**
@@ -268,8 +349,18 @@ class ArtifactUploader {
     
     scanDir(testResultsDir);
     
-    Logger.info('ArtifactUploader', `Filesystem scan found ${artifacts.length} artifacts`);
-    return artifacts;
+    const filtered = artifacts.filter((artifact) => {
+      const denied = isCredentialFile(artifact.fullPath, artifact.fileName);
+      if (denied) {
+        Logger.warn('ArtifactUploader', 'Deny-listed credential file excluded from filesystem artifact scan', {
+          fileName: artifact.fileName,
+        });
+      }
+      return !denied;
+    });
+
+    Logger.info('ArtifactUploader', `Filesystem scan found ${filtered.length} artifacts`);
+    return filtered;
   }
 
 
@@ -510,8 +601,9 @@ class ArtifactUploader {
    */
   async processAndUpload(runId, testResults) {
     try {
-      Logger.info('ArtifactUploader', `processAndUpload called for run ${runId}`);
-      const artifacts = this.collectFailureArtifacts(testResults);
+      const includePassed = this.config.videoMode === 'on' || this.config.artifactMode === 'full';
+      Logger.info('ArtifactUploader', `processAndUpload called for run ${runId}`, { includePassed });
+      const artifacts = this.collectArtifacts(testResults, { includePassed });
       Logger.info('ArtifactUploader', `Collected ${artifacts.length} artifacts, proceeding to upload`);
       
       if (artifacts.length === 0) {
